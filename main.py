@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 
 # Page Setup
 st.set_page_config(
@@ -10,23 +11,86 @@ st.set_page_config(
 )
 
 st.title("🧬 무작위 유전적 부동과 고정지수(F_ST) 분화 시뮬레이터")
-st.markdown("하디-바인베르크 평형 조건이 깨지는 **유전적 부동(Genetic Drift)과 집단 격리** 환경에서 $F_{ST}$ 지수 변화를 탐구합니다.")
+st.markdown("NCBI Open API 데이터 연동 및 인구유전학 수식을 결합하여 **유전적 부동과 집단 격리** 환경을 탐구합니다.")
 st.divider()
 
-# Sidebar Setup
-st.sidebar.header("⚙️ 집단유전학 변수 설정")
+# ---------------------------------------------------------
+# Secrets & API Handling
+# ---------------------------------------------------------
+# Streamlit Secrets에서 NCBI API 키 불러오기 (없을 시 기본 퍼블릭 키 처리)
+try:
+    ncbi_api_key = st.secrets["NCBI_API_KEY"]
+    has_secret_key = True
+except Exception:
+    ncbi_api_key = None
+    has_secret_key = False
 
-p_init = st.sidebar.slider("초기 대립유전자 A 빈도 (p)", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
-num_subpops = st.sidebar.slider("격리된 하위 집단 개수 (Subpopulations, k)", min_value=2, max_value=10, value=5, step=1)
-pop_size = st.sidebar.slider("하위 집단별 개체 수 (N)", min_value=10, max_value=1000, value=50, step=10)
-generations = st.sidebar.number_input("추적할 세대 수 (Generations)", min_value=10, max_value=300, value=100, step=10)
+def fetch_ncbi_gene_summary(gene_symbol, api_key=None):
+    """NCBI Entrez Direct API를 호출하여 유전자 데이터 조회"""
+    try:
+        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        params = {
+            "db": "gene",
+            "term": f"{gene_symbol}[Gene Name] AND human[Organism]",
+            "retmode": "json"
+        }
+        if api_key:
+            params["api_key"] = api_key
+            
+        response = requests.get(url, params=params, timeout=4)
+        if response.status_code == 200:
+            data = response.json()
+            id_list = data.get("esearchresult", {}).get("idlist", [])
+            if id_list:
+                gene_id = id_list[0]
+                return True, gene_id, f"NCBI Gene ID: {gene_id} 연동 성공"
+            else:
+                return False, None, "유전자 검색 결과가 없어 기본 대립유전자 빈도를 사용합니다."
+        return False, None, f"API 응답 실패 (Status: {response.status_code})"
+    except Exception as e:
+        return False, None, f"네트워크 통신 예외 발생 (기본값으로 가상 실행합니다)"
+
+# ---------------------------------------------------------
+# Sidebar Setup
+# ---------------------------------------------------------
+st.sidebar.header("🔑 1. API 보안 및 유전자 검색")
+
+if has_secret_key:
+    st.sidebar.success("🔒 Streamlit Secrets: NCBI_API_KEY 인증 성공")
+else:
+    st.sidebar.info("💡 Secrets 미설정 상태: Public API 모드로 동작합니다.")
+
+use_ncbi_api = st.sidebar.checkbox("NCBI Entrez API 유전자 검색 연동", value=False)
+
+p_init = 0.50
+
+if use_ncbi_api:
+    target_gene = st.sidebar.text_input("검색할 인간 유전자 기호 (예: BRCA1, TP53)", value="BRCA1")
+    success, g_id, api_msg = fetch_ncbi_gene_summary(target_gene, ncbi_api_key)
+    
+    if success:
+        st.sidebar.success(api_msg)
+        # 유전자 ID 해시값을 활용한 임의 대립유전자 초기 빈도 산출 (0.2~0.8)
+        p_init = round(0.2 + (int(g_id) % 60) / 100.0, 2)
+        st.sidebar.info(f"선택 유전자 기반 대립유전자(A) 초기 빈도(p): **{p_init}**")
+    else:
+        st.sidebar.warning(api_msg)
+        p_init = st.sidebar.slider("초기 대립유전자 A 빈도 (p)", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
+else:
+    p_init = st.sidebar.slider("초기 대립유전자 A 빈도 (p)", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
 
 st.sidebar.divider()
-st.sidebar.subheader("🔀 이주율 (Gene Flow)")
+st.sidebar.header("⚙️ 2. 집단유전학 변수 설정")
+
+num_subpops = st.sidebar.slider("격리된 하위 집단 개수 (k)", min_value=2, max_value=10, value=5, step=1)
+pop_size = st.sidebar.slider("하위 집단별 개체 수 (N)", min_value=10, max_value=1000, value=50, step=10)
+generations = st.sidebar.number_input("추적할 세대 수 (Generations)", min_value=10, max_value=300, value=100, step=10)
 migration_rate = st.sidebar.slider("집단 간 이주율 (m)", min_value=0.00, max_value=0.20, value=0.01, step=0.01)
 
+# ---------------------------------------------------------
 # Simulation Logic
-np.random.seed(42)  # 재현성을 위한 시드 고정
+# ---------------------------------------------------------
+np.random.seed(42)
 
 p_matrix = np.zeros((generations + 1, num_subpops))
 p_matrix[0, :] = p_init
@@ -35,11 +99,10 @@ fst_list = []
 hs_list = []
 ht_list = []
 
-# Generation Loop
 for g in range(generations):
     current_p = p_matrix[g, :]
     
-    # 1. HWE 연산 및 FST 산출
+    # 1. HWE 및 FST 연산
     mean_p = np.mean(current_p)
     H_S = np.mean(2 * current_p * (1 - current_p))
     H_T = 2 * mean_p * (1 - mean_p)
@@ -50,10 +113,8 @@ for g in range(generations):
     ht_list.append(round(H_T, 4))
     fst_list.append(round(max(0.0, F_ST), 4))
     
-    # 2. 이주(Gene Flow) 효과 반영
+    # 2. 이주 및 무작위 유전적 부동 연산
     p_migrated = (1 - migration_rate) * current_p + migration_rate * mean_p
-    
-    # 3. 무작위 유전적 부동 (이항 샘플링)
     next_p = np.random.binomial(2 * pop_size, p_migrated) / (2 * pop_size)
     p_matrix[g + 1, :] = next_p
 
@@ -79,7 +140,9 @@ df_stats = pd.DataFrame({
     "H_T (전체 이형접합도)": ht_list
 })
 
+# ---------------------------------------------------------
 # Output UI
+# ---------------------------------------------------------
 st.subheader("📊 1. 최종 세대 유전적 분화 결과 요약")
 
 col1, col2, col3, col4 = st.columns(4)
