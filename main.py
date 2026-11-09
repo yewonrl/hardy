@@ -1,23 +1,27 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import math
 import requests
 
 # Page Setup
 st.set_page_config(
-    page_title="하디-바인베르크 & FST 시뮬레이터",
+    page_title="하디-바인베르크 유전병 보인자 추정기",
     page_icon="🧬",
     layout="wide"
 )
 
-st.title("🧬 무작위 유전적 부동과 고정지수(F_ST) 분화 시뮬레이터")
-st.markdown("NCBI Open API 데이터 연동 및 인구유전학 수식을 결합하여 **유전적 부동과 집단 격리** 환경을 탐구합니다.")
+st.title("🧬 하디-바인베르크 법칙 기반 열성 유전병 보인자 빈도 분석기")
+st.markdown(
+    "> *\"유전 질환의 경우 특정 유전자가 두 개 모두 있을 때 질병이 나타나는 열성 유전병에 대해, "
+    "해당 유전자를 하나만 지닌 보인자가 인구 중 얼마나 되는 지를 추정할 수 있다. "
+    "이는 질병의 실제 환자 빈도와 함께 계산되어, 해당 유전자가 집단에 얼마나 퍼져 있는 지를 예측하는 데 도움이 된다.\"*"
+)
 st.divider()
 
 # ---------------------------------------------------------
-# Secrets & API Handling
+# Secrets & API Handling (NCBI Entrez API)
 # ---------------------------------------------------------
-# Streamlit Secrets에서 NCBI API 키 불러오기 (없을 시 기본 퍼블릭 키 처리)
 try:
     ncbi_api_key = st.secrets["NCBI_API_KEY"]
     has_secret_key = True
@@ -25,161 +29,163 @@ except Exception:
     ncbi_api_key = None
     has_secret_key = False
 
-def fetch_ncbi_gene_summary(gene_symbol, api_key=None):
-    """NCBI Entrez Direct API를 호출하여 유전자 데이터 조회"""
+def fetch_gene_info(gene_name, api_key=None):
+    """NCBI Entrez API를 통해 열성 유전병 관련 유전자 ID 조회"""
     try:
         url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         params = {
             "db": "gene",
-            "term": f"{gene_symbol}[Gene Name] AND human[Organism]",
+            "term": f"{gene_name}[Gene Name] AND human[Organism]",
             "retmode": "json"
         }
         if api_key:
             params["api_key"] = api_key
             
-        response = requests.get(url, params=params, timeout=4)
-        if response.status_code == 200:
-            data = response.json()
+        res = requests.get(url, params=params, timeout=4)
+        if res.status_code == 200:
+            data = res.json()
             id_list = data.get("esearchresult", {}).get("idlist", [])
             if id_list:
-                gene_id = id_list[0]
-                return True, gene_id, f"NCBI Gene ID: {gene_id} 연동 성공"
-            else:
-                return False, None, "유전자 검색 결과가 없어 기본 대립유전자 빈도를 사용합니다."
-        return False, None, f"API 응답 실패 (Status: {response.status_code})"
-    except Exception as e:
-        return False, None, f"네트워크 통신 예외 발생 (기본값으로 가상 실행합니다)"
+                return True, id_list[0], f"NCBI Gene ID: {id_list[0]} 연동 성공"
+        return False, None, "NCBI 데이터베이스에서 해당 유전자를 찾을 수 없습니다."
+    except Exception:
+        return False, None, "네트워크 통신 예외 발생 (기본 모드로 동작합니다)."
 
 # ---------------------------------------------------------
 # Sidebar Setup
 # ---------------------------------------------------------
-st.sidebar.header("🔑 1. API 보안 및 유전자 검색")
+st.sidebar.header("🔑 1. API 보안 및 유전자 조회")
 
 if has_secret_key:
-    st.sidebar.success("🔒 Streamlit Secrets: NCBI_API_KEY 인증 성공")
+    st.sidebar.success("🔒 Streamlit Secrets: NCBI_API_KEY 연동 완료")
 else:
-    st.sidebar.info("💡 Secrets 미설정 상태: Public API 모드로 동작합니다.")
+    st.sidebar.info("💡 Secrets 미설정: Public API 모드로 동작합니다.")
 
-use_ncbi_api = st.sidebar.checkbox("NCBI Entrez API 유전자 검색 연동", value=False)
+preset_disease = st.sidebar.selectbox(
+    "주요 열성 유전병 예시 선택",
+    [
+        "직접 입력 (사용자 설정)",
+        "낭성 섬유증 (Cystic Fibrosis, CFTR 유전자)",
+        "페닐케톤뇨증 (PKU, PAH 유전자)",
+        "겸상 적혈구 빈혈증 (Sickle Cell Anemia, HBB 유전자)",
+        "테이-삭스병 (Tay-Sachs Disease, HEXA 유전자)"
+    ]
+)
 
-p_init = 0.50
+# Preset data (환자 발병 빈도 q^2)
+preset_data = {
+    "낭성 섬유증 (Cystic Fibrosis, CFTR 유전자)": ("CFTR", 0.0004),      # 1/2500
+    "페닐케톤뇨증 (PKU, PAH 유전자)": ("PAH", 0.0001),                    # 1/10000
+    "겸상 적혈구 빈혈증 (Sickle Cell Anemia, HBB 유전자)": ("HBB", 0.0025), # 1/400
+    "테이-삭스병 (Tay-Sachs Disease, HEXA 유전자)": ("HEXA", 0.00028)    # 1/3600
+}
 
-if use_ncbi_api:
-    target_gene = st.sidebar.text_input("검색할 인간 유전자 기호 (예: BRCA1, TP53)", value="BRCA1")
-    success, g_id, api_msg = fetch_ncbi_gene_summary(target_gene, ncbi_api_key)
-    
-    if success:
+if preset_disease != "직접 입력 (사용자 설정)":
+    gene_symbol, default_q2 = preset_data[preset_disease]
+    q2_input = default_q2
+    st.sidebar.write(f"**연관 유전자:** `{gene_symbol}`")
+else:
+    gene_symbol = st.sidebar.text_input("유전자 기호 입력", value="CFTR")
+    q2_input = st.sidebar.number_input("열성 환자 발병률 (q²)", min_value=0.000001, max_value=0.200000, value=0.000400, step=0.000100, format="%.6f")
+
+use_api = st.sidebar.checkbox("NCBI API 유전자 정보 파싱 연동", value=True)
+if use_api and gene_symbol:
+    api_success, g_id, api_msg = fetch_gene_info(gene_symbol, ncbi_api_key)
+    if api_success:
         st.sidebar.success(api_msg)
-        # 유전자 ID 해시값을 활용한 임의 대립유전자 초기 빈도 산출 (0.2~0.8)
-        p_init = round(0.2 + (int(g_id) % 60) / 100.0, 2)
-        st.sidebar.info(f"선택 유전자 기반 대립유전자(A) 초기 빈도(p): **{p_init}**")
     else:
         st.sidebar.warning(api_msg)
-        p_init = st.sidebar.slider("초기 대립유전자 A 빈도 (p)", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
-else:
-    p_init = st.sidebar.slider("초기 대립유전자 A 빈도 (p)", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
 
 st.sidebar.divider()
-st.sidebar.header("⚙️ 2. 집단유전학 변수 설정")
-
-num_subpops = st.sidebar.slider("격리된 하위 집단 개수 (k)", min_value=2, max_value=10, value=5, step=1)
-pop_size = st.sidebar.slider("하위 집단별 개체 수 (N)", min_value=10, max_value=1000, value=50, step=10)
-generations = st.sidebar.number_input("추적할 세대 수 (Generations)", min_value=10, max_value=300, value=100, step=10)
-migration_rate = st.sidebar.slider("집단 간 이주율 (m)", min_value=0.00, max_value=0.20, value=0.01, step=0.01)
+st.sidebar.header("⚙️ 2. 집단 규모 및 조건 설정")
+total_population = st.sidebar.number_input("분석 대상 집단 인구수 (명)", min_value=1000, max_value=100000000, value=100000, step=10000)
 
 # ---------------------------------------------------------
-# Simulation Logic
+# Hardy-Weinberg Calculation Logic
 # ---------------------------------------------------------
-np.random.seed(42)
+# q^2 = 환자 빈도 (aa)
+# q = sqrt(q^2) -> 열성 대립유전자 빈도
+# p = 1 - q    -> 정상 대립유전자 빈도
+# p^2 = 정상인 (AA)
+# 2pq = 보인자 (Aa)
 
-p_matrix = np.zeros((generations + 1, num_subpops))
-p_matrix[0, :] = p_init
+q = math.sqrt(q2_input)
+p = 1.0 - q
 
-fst_list = []
-hs_list = []
-ht_list = []
+p2_freq = p ** 2
+two_pq_freq = 2 * p * q
 
-for g in range(generations):
-    current_p = p_matrix[g, :]
-    
-    # 1. HWE 및 FST 연산
-    mean_p = np.mean(current_p)
-    H_S = np.mean(2 * current_p * (1 - current_p))
-    H_T = 2 * mean_p * (1 - mean_p)
-    
-    F_ST = (H_T - H_S) / H_T if H_T > 0 else 0.0
-    
-    hs_list.append(round(H_S, 4))
-    ht_list.append(round(H_T, 4))
-    fst_list.append(round(max(0.0, F_ST), 4))
-    
-    # 2. 이주 및 무작위 유전적 부동 연산
-    p_migrated = (1 - migration_rate) * current_p + migration_rate * mean_p
-    next_p = np.random.binomial(2 * pop_size, p_migrated) / (2 * pop_size)
-    p_matrix[g + 1, :] = next_p
+num_affected = int(round(total_population * q2_input))
+num_carriers = int(round(total_population * two_pq_freq))
+num_normal = total_population - num_affected - num_carriers
 
-# 마지막 세대 FST 산출
-final_p = p_matrix[-1, :]
-mean_p_final = np.mean(final_p)
-H_S_final = np.mean(2 * final_p * (1 - final_p))
-H_T_final = 2 * mean_p_final * (1 - mean_p_final)
-F_ST_final = (H_T_final - H_S_final) / H_T_final if H_T_final > 0 else 0.0
-
-hs_list.append(round(H_S_final, 4))
-ht_list.append(round(H_T_final, 4))
-fst_list.append(round(max(0.0, F_ST_final), 4))
-
-# Dataframe Assembly
-df_p = pd.DataFrame(p_matrix, columns=[f"집단 {i+1}" for i in range(num_subpops)])
-df_p["세대"] = list(range(generations + 1))
-
-df_stats = pd.DataFrame({
-    "세대": list(range(generations + 1)),
-    "F_ST (고정지수)": fst_list,
-    "H_S (집단내 이형접합도)": hs_list,
-    "H_T (전체 이형접합도)": ht_list
-})
+# Carrier to Patient Ratio
+ratio_carrier_to_patient = round(two_pq_freq / q2_input, 1) if q2_input > 0 else 0
 
 # ---------------------------------------------------------
-# Output UI
+# UI Main Output
 # ---------------------------------------------------------
-st.subheader("📊 1. 최종 세대 유전적 분화 결과 요약")
+st.subheader("📊 1. 유전자 빈도 및 인구 집단 추정 메트릭")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("초기 p 빈도", f"{p_init:.2f}")
-col2.metric("최종 F_ST (고정지수)", f"{fst_list[-1]:.4f}")
-col3.metric("최종 H_S (하위집단 이형성)", f"{hs_list[-1]:.4f}")
-col4.metric("최종 H_T (전체집단 이형성)", f"{ht_list[-1]:.4f}")
+col1.metric("열성 대립유전자 빈도 (q)", f"{q:.4f}")
+col2.metric("정상 대립유전자 빈도 (p)", f"{p:.4f}")
+col3.metric("추정 보인자 비율 (2pq)", f"{two_pq_freq * 100:.2f}%")
+col4.metric("환자 1명당 보인자 비율", f"{ratio_carrier_to_patient:.1f} 배")
 
 st.divider()
 
-st.subheader("📈 2. 세대별 하위 집단 대립유전자 빈도(p) 및 F_ST 추이")
+st.subheader(f"👥 2. 인구 {total_population:,}명 기준 예상 유전자형 구성")
 
-tab1, tab2 = st.tabs(["하위 집단별 p 빈도 변화", "F_ST (고정지수) 변화 곡선"])
-
-with tab1:
-    chart_p = df_p.set_index("세대")
-    st.line_chart(chart_p)
-
-with tab2:
-    chart_fst = df_stats.set_index("세대")[["F_ST (고정지수)"]]
-    st.line_chart(chart_fst)
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("정상인 (AA)", f"{num_normal:,} 명", f"{p2_freq*100:.2f}%")
+col_b.metric("보인자 (Aa, 증상 없음)", f"{num_carriers:,} 명", f"{two_pq_freq*100:.2f}%")
+col_c.metric("열성 환자 (aa)", f"{num_affected:,} 명", f"{q2_input*100:.4f}%")
 
 st.divider()
 
-st.subheader("🧪 3. 인구유전학 학술 메커니즘 분석")
+st.subheader("📈 3. 열성 대립유전자 빈도(q) 변화에 따른 유전자형 비율 곡선")
 
-final_fst_val = fst_list[-1]
+# Graph Simulation Range
+q_range = np.linspace(0.001, 0.5, 100)
+p_range = 1.0 - q_range
 
-if final_fst_val < 0.05:
-    st.info("💡 **유전적 분화 미미 (F_ST < 0.05):** 활발한 이주(Gene Flow) 또는 큰 집단 크기로 인해 하위 집단 간 유전적 차이가 거의 없으며 하디-바인베르크 평형 상태에 가깝습니다.")
-elif final_fst_val < 0.15:
-    st.warning("💡 **중등도 유전적 분화 (0.05 ≤ F_ST < 0.15):** 유전적 부동에 의해 하위 집단 간 대립유전자 빈도 차이가 벌어지기 시작했습니다.")
-elif final_fst_val < 0.25:
-    st.warning("🚨 **높은 유전적 분화 (0.15 ≤ F_ST < 0.25):** 지리적 격리와 부동 효과로 인해 집단 간 유전적 교류가 차단되어 독자적인 유전자 풀을 형성하고 있습니다.")
-else:
-    st.error("🚨 **극도로 높은 유전적 분화 (F_ST ≥ 0.25):** 대립유전자 고정(Fixation) 현상이 관찰되며, 집단 간 유전적 차이가 심화되어 종 분화(Speciation) 가능성이 존재합니다.")
+df_graph = pd.DataFrame({
+    "열성 대립유전자 빈도 (q)": q_range,
+    "정상인 비율 (p²)": p_range ** 2,
+    "보인자 비율 (2pq)": 2 * p_range * q_range,
+    "환자 비율 (q²)": q_range ** 2
+})
+
+chart_df = df_graph.set_index("열성 대립유전자 빈도 (q)")
+st.line_chart(chart_df)
 
 st.divider()
-st.subheader("📋 4. 세대별 상세 수치 데이터")
-st.dataframe(df_stats, use_container_width=True)
+
+st.subheader("🧪 4. 세특용 생명과학 및 의학적 해석 보고서")
+
+st.info(
+    f"💡 **학술 해석:**  \n"
+    f"선택한 조건에서 실제 **열성 질환 환자(aa)**는 집단의 **{q2_input*100:.4f}%({num_affected:,}명)**에 불과하지만, "
+    f"증상이 전혀 없는 **잠재적 보인자(Aa)**는 전체 인구의 **{two_pq_freq*100:.2f}%({num_carriers:,}명)**에 달합니다.  \n"
+    f"즉, **환자 1명이 발생할 때 집단 내에는 약 {ratio_carrier_to_patient:.1f}명의 보인자가 숨어 있음**을 의미합니다."
+)
+
+st.warning(
+    "🚨 **보인자 빈도 추정의 중요성:**  \n"
+    "희귀 열성 유전병이라 하더라도 대립유전자 빈도 수식($q = \\sqrt{\\text{발병률}}$)의 특성상, "
+    "열성 유전자가 집단 내에서 완전히 사라지지 않고 상당수 보인자(Aa)의 형태로 보존됩니다. "
+    "이는 유전 상담, 산전 유전자 검사 및 유전병 예방 프로그램 수립에 있어 결정적인 수학적 근거가 됩니다."
+)
+
+st.divider()
+st.subheader("📋 5. 세부 수치 데이터 시뮬레이션 표")
+
+df_summary = pd.DataFrame({
+    "구분": ["정상인 (AA)", "보인자 (Aa)", "환자 (aa)"],
+    "유전자형 수식": ["p²", "2pq", "q²"],
+    "집단 내 비율 (%)": [f"{p2_freq*100:.4f}%", f"{two_pq_freq*100:.4f}%", f"{q2_input*100:.6f}%"],
+    "추정 인구수 (명)": [f"{num_normal:,}", f"{num_carriers:,}", f"{num_affected:,}"]
+})
+
+st.dataframe(df_summary, use_container_width=True)
