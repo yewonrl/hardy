@@ -20,7 +20,7 @@ st.markdown(
 st.divider()
 
 # ---------------------------------------------------------
-# Secrets & API Handling (NCBI Entrez API)
+# Secrets & API Handling (NCBI 다중 DB 연동)
 # ---------------------------------------------------------
 try:
     ncbi_api_key = st.secrets["NCBI_API_KEY"]
@@ -29,27 +29,42 @@ except Exception:
     ncbi_api_key = None
     has_secret_key = False
 
-def fetch_gene_info(gene_name, api_key=None):
-    """NCBI Entrez API를 통해 열성 유전병 관련 유전자 ID 조회"""
+# [새로 추가된 통합 API 함수]
+def fetch_ncbi_combined_data(gene_id, rs_id, api_key=None):
+    """NCBI의 gene DB와 snp DB를 모두 호출하여 정보와 대립유전자 빈도를 가져오는 함수"""
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+    result_data = {"success": False, "symbol": "", "description": "", "q_value": None}
+    
+    # 1. db=gene 호출 (유전자 정보)
     try:
-        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        params = {
-            "db": "gene",
-            "term": f"{gene_name}[Gene Name] AND human[Organism]",
-            "retmode": "json"
-        }
-        if api_key:
-            params["api_key"] = api_key
-            
-        res = requests.get(url, params=params, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            id_list = data.get("esearchresult", {}).get("idlist", [])
-            if id_list:
-                return True, id_list[0], f"NCBI Gene ID: {id_list[0]} 연동 성공"
-        return False, None, "NCBI 데이터베이스에서 해당 유전자를 찾을 수 없습니다."
+        gene_params = {"db": "gene", "id": gene_id, "retmode": "json"}
+        if api_key: gene_params["api_key"] = api_key
+        gene_resp = requests.get(base_url, params=gene_params, timeout=4)
+        if gene_resp.status_code == 200:
+            gene_info = gene_resp.json().get("result", {}).get(str(gene_id), {})
+            result_data["symbol"] = gene_info.get("name", "Unknown")
+            result_data["description"] = gene_info.get("summary", "설명이 없습니다.")
+            result_data["success"] = True
     except Exception:
-        return False, None, "네트워크 통신 예외 발생 (기본 모드로 동작합니다)."
+        pass # 실패 시 기본값 유지
+
+    # 2. db=snp 호출 (대립유전자 빈도)
+    if rs_id:
+        snp_id_only = rs_id.replace("rs", "")
+        try:
+            snp_params = {"db": "snp", "id": snp_id_only, "retmode": "json"}
+            if api_key: snp_params["api_key"] = api_key
+            snp_resp = requests.get(base_url, params=snp_params, timeout=4)
+            if snp_resp.status_code == 200:
+                snp_info = snp_resp.json().get("result", {}).get(snp_id_only, {})
+                if "global_maf" in snp_info:
+                    maf_str = snp_info["global_maf"]
+                    if "=" in maf_str and "/" in maf_str:
+                        result_data["q_value"] = float(maf_str.split("=")[1].split("/")[0])
+        except Exception:
+            pass
+
+    return result_data
 
 # ---------------------------------------------------------
 # Sidebar Setup: 1. API & 유전자 선택
@@ -61,39 +76,49 @@ if has_secret_key:
 else:
     st.sidebar.info("💡 Secrets 미설정: Public API 모드")
 
-preset_disease = st.sidebar.selectbox(
-    "주요 열성 유전병 예시 선택",
-    [
-        "직접 입력 (사용자 설정)",
-        "낭성 섬유증 (Cystic Fibrosis, CFTR 유전자)",
-        "페닐케톤뇨증 (PKU, PAH 유전자)",
-        "겸상 적혈구 빈혈증 (Sickle Cell Anemia, HBB 유전자)",
-        "테이-삭스병 (Tay-Sachs Disease, HEXA 유전자)"
-    ]
-)
-
-# Preset data (환자 발병 빈도 q^2)
+# [수정된 프리셋 데이터: Gene ID와 rsID 추가]
 preset_data = {
-    "낭성 섬유증 (Cystic Fibrosis, CFTR 유전자)": ("CFTR", 0.0004),      # 1/2500
-    "페닐케톤뇨증 (PKU, PAH 유전자)": ("PAH", 0.0001),                    # 1/10000
-    "겸상 적혈구 빈혈증 (Sickle Cell Anemia, HBB 유전자)": ("HBB", 0.0025), # 1/400
-    "테이-삭스병 (Tay-Sachs Disease, HEXA 유전자)": ("HEXA", 0.00028)    # 1/3600
+    "낭성 섬유증 (Cystic Fibrosis)": {"symbol": "CFTR", "gene_id": "1080", "rs_id": "rs113993960", "default_q2": 0.0004},
+    "겸상 적혈구 빈혈증 (Sickle Cell)": {"symbol": "HBB", "gene_id": "3043", "rs_id": "rs334", "default_q2": 0.0025},
+    "페닐케톤뇨증 (PKU)": {"symbol": "PAH", "gene_id": "5053", "rs_id": "rs5030858", "default_q2": 0.0001}
 }
 
-if preset_disease != "직접 입력 (사용자 설정)":
-    gene_symbol, default_q2 = preset_data[preset_disease]
-    st.sidebar.write(f"**연관 유전자:** `{gene_symbol}`")
-else:
-    gene_symbol = st.sidebar.text_input("유전자 기호 입력", value="CFTR")
-    default_q2 = 0.0004
+preset_disease = st.sidebar.selectbox(
+    "주요 열성 유전병 예시 선택",
+    ["직접 입력 (사용자 설정)"] + list(preset_data.keys())
+)
 
-use_api = st.sidebar.checkbox("NCBI API 유전자 정보 파싱 연동", value=True)
-if use_api and gene_symbol:
-    api_success, g_id, api_msg = fetch_gene_info(gene_symbol, ncbi_api_key)
-    if api_success:
-        st.sidebar.success(api_msg)
+default_q2 = 0.0004
+api_q_value = None
+
+if preset_disease != "직접 입력 (사용자 설정)":
+    disease_info = preset_data[preset_disease]
+    st.sidebar.write(f"**연관 유전자:** `{disease_info['symbol']}` (ID: {disease_info['gene_id']})")
+    
+    use_api = st.sidebar.checkbox("NCBI API 유전자 정보 및 발병률 파싱", value=True)
+    
+    if use_api:
+        with st.sidebar.spinner('Gene & SNP 연동 중...'):
+            api_result = fetch_ncbi_combined_data(disease_info['gene_id'], disease_info['rs_id'], ncbi_api_key)
+            
+        if api_result["success"]:
+            st.sidebar.success(f"NCBI 정보 연동 완료 ({api_result['symbol']})")
+            api_q_value = api_result["q_value"]
+            
+            if api_q_value is not None and api_q_value > 0:
+                st.sidebar.info(f"🌐 실시간 글로벌 빈도(q): {api_q_value:.4f}")
+                default_q2 = api_q_value ** 2 # API로 가져온 q값을 q^2으로 역산하여 기본값 대체
+            else:
+                st.sidebar.warning("SNP 빈도 데이터 없음. 프리셋 수치를 사용합니다.")
+                default_q2 = disease_info['default_q2']
+        else:
+            st.sidebar.error("API 통신 실패. 기본 모드로 동작합니다.")
+            default_q2 = disease_info['default_q2']
     else:
-        st.sidebar.warning(api_msg)
+        default_q2 = disease_info['default_q2']
+else:
+    st.sidebar.text_input("유전자 기호 입력", value="직접 입력 모드")
+    default_q2 = 0.0004
 
 st.sidebar.divider()
 
@@ -103,7 +128,7 @@ st.sidebar.divider()
 st.sidebar.header("⚙️ 2. 환자 발생 빈도 상세 입력")
 input_mode = st.sidebar.radio(
     "데이터 입력 방식을 선택하세요:",
-    ["프리셋 기본값 사용", "백분율 (%)", "비율 (N명 중 1명)", "실제 환자 수 직접 입력"]
+    ["프리셋/API 연동값 사용", "백분율 (%)", "비율 (N명 중 1명)", "실제 환자 수 직접 입력"]
 )
 
 q2_input = default_q2
@@ -139,11 +164,9 @@ else:
 # ---------------------------------------------------------
 # Hardy-Weinberg Calculation Logic (F 계수 포함)
 # ---------------------------------------------------------
-# F = 0 일 때는 기존 하디-바인베르크 수식과 완벽히 동일함
 q = math.sqrt(q2_input)
 p = 1.0 - q
 
-# F(근친교배 계수)가 반영된 실제 유전자형 빈도
 freq_AA = (p ** 2) + (p * q * f_coef)
 freq_Aa = (2 * p * q) * (1 - f_coef)
 freq_aa = (q ** 2) + (p * q * f_coef)
@@ -152,7 +175,6 @@ num_affected = int(round(total_population * freq_aa))
 num_carriers = int(round(total_population * freq_Aa))
 num_normal = total_population - num_affected - num_carriers
 
-# Carrier to Patient Ratio (안전한 나눗셈)
 ratio_carrier_to_patient = round(freq_Aa / freq_aa, 1) if freq_aa > 0 else 0
 
 # ---------------------------------------------------------
@@ -179,11 +201,9 @@ st.divider()
 
 st.subheader("📈 3. 열성 대립유전자 빈도(q) 변화에 따른 유전자형 비율 곡선")
 
-# Graph Simulation Range
 q_range = np.linspace(0.001, 0.5, 100)
 p_range = 1.0 - q_range
 
-# F 계수가 반영된 그래프 데이터 프레임
 df_graph = pd.DataFrame({
     "열성 대립유전자 빈도 (q)": q_range,
     "정상인 비율 (AA)": (p_range ** 2) + (p_range * q_range * f_coef),
